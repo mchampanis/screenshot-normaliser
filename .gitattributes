@@ -1,0 +1,15 @@
+# line endings to LF in the repo
+* text=auto eol=lf
+
+# explicitly text
+*.py    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+
+# samples are binary - no diffs
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.bmp   binary
+*.tiff  binary
+*.webp  binary
