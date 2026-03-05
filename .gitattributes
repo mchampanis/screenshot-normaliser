@@ -1,12 +1,12 @@
-# line endings to LF in the repo
+# line endings to LF
 * text=auto eol=lf
 
-# explicitly text
+# text files
 *.py    text eol=lf
 *.toml  text eol=lf
 *.md    text eol=lf
 
-# samples are binary - no diffs
+# binary - no diffs
 *.png   binary
 *.jpg   binary
 *.jpeg  binary

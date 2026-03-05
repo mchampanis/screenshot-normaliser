@@ -4,6 +4,7 @@
 #     "opencv-python>=4.8",
 #     "Pillow>=10.0",
 #     "numpy>=1.24",
+#     "rembg[cpu]>=2.0.50",
 # ]
 # ///
 """
@@ -16,7 +17,7 @@ background in the screenshots).
 Works best if you purposefully capture extra wallpaper all around the app in
 each screenshot.
 
-Ideally this program is used to normalise a collection of screenshots of the
+This program is used to normalise a collection of screenshots of the
 same app (with same size app window), its primary purpose is to fix the uneven
 wallpaper borders you get whilst taking a screenshot free-hand with the snip
 tool.
@@ -44,6 +45,16 @@ from tkinter import ttk, filedialog, messagebox, colorchooser
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
+import rembg
+
+_rembg_session = None
+
+
+def _get_rembg_session():
+    global _rembg_session
+    if _rembg_session is None:
+        _rembg_session = rembg.new_session()
+    return _rembg_session
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,36 +157,103 @@ def detect_window(img: np.ndarray, sensitivity: float = 0.5) -> Optional[Rect]:
     """
     Detect the dominant rectangular app window in a screenshot.
 
-    Tries three complementary methods in order of reliability:
-      1. Luminance threshold — excellent for dark window on bright wallpaper
-         (or vice versa); uses Otsu's threshold + row/col projection.
-      2. Background colour distance — good when wallpaper has a distinctive
-         colour sampled from the image corners.
-      3. Hough line detection — fallback for windows with a clear frame border.
+    Runs all methods and takes the intersection of valid results.  Noisy
+    methods (edges, contours) tend to expand outward toward image boundaries;
+    the intersection clips them back to the conservative consensus region.
 
     sensitivity: 0.0 = strict -> 1.0 = loose
     """
     h, w = img.shape[:2]
     min_area = 0.10 * w * h
+    max_area = 0.99 * w * h
 
-    for method in (_detect_by_luminance, _detect_by_background, _detect_by_edges):
+    def _valid(r: Optional[Rect]) -> bool:
+        return r is not None and min_area < r.area() < max_area
+
+    candidates = []
+    for method in (_detect_by_rembg, _detect_by_luminance, _detect_by_background, _detect_by_edges, _detect_by_contours):
         result = method(img, sensitivity)
-        if result and result.area() > min_area and result.w < w and result.h < h:
-            return result
+        if _valid(result):
+            candidates.append(result)
 
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Intersect all candidates: each method clips the others' outliers
+    left   = max(r.x          for r in candidates)
+    top    = max(r.y          for r in candidates)
+    right  = min(r.x + r.w    for r in candidates)
+    bottom = min(r.y + r.h    for r in candidates)
+
+    if right > left and bottom > top:
+        inter = Rect(left, top, right - left, bottom - top)
+        if _valid(inter):
+            return inter
+
+    # Intersection is degenerate (methods disagree wildly) — use highest-priority valid result
+    return candidates[0]
+
+
+def _detect_by_rembg(img: np.ndarray, sensitivity: float) -> Optional[Rect]:
+    """
+    Detect window by using ML (U2-Net) to remove the wallpaper background.
+    Very robust against complex wallpaper, gradients, and shadows.
+    """
+    try:
+        # rembg accepts RGBA numpy arrays and returns RGBA numpy arrays
+        rgba = cv2.cvtColor(img, cv2.COLOR_BGR2RGBA)
+        result = rembg.remove(rgba, session=_get_rembg_session())
+        # result is an RGBA numpy array; derive the bounding box from the alpha channel
+        if not isinstance(result, np.ndarray):
+            result = np.array(result)
+        alpha = result[:, :, 3]
+        rows = np.where(alpha.any(axis=1))[0]
+        cols = np.where(alpha.any(axis=0))[0]
+        if rows.size == 0 or cols.size == 0:
+            return None
+        top, bottom = int(rows[0]), int(rows[-1])
+        left, right = int(cols[0]), int(cols[-1])
+        return Rect(left, top, right - left + 1, bottom - top + 1)
+    except Exception:
+        pass
     return None
 
 
-def _longest_window_run(frac: np.ndarray, threshold: float) -> Optional[tuple[int, int]]:
+def _longest_window_run(frac: np.ndarray, threshold: float, trim_fraction: float = 0.0) -> Optional[tuple[int, int]]:
     """
     Find the longest contiguous run of values above `threshold`.
     Returns (start, end) indices, or None.
 
     Using the longest run (rather than first/last index) avoids being misled
     by stray edge-pixels at the image border, which can spike frac to 1.0.
+
+    Gaps of up to 5 consecutive below-threshold rows that are flanked by
+    above-threshold on both sides are filled before run detection (thin
+    separator lines within the window).  Gaps at the array boundary or
+    against non-window regions are never filled.
+
+    If trim_fraction > 0, the run ends are walked inward until frac reaches
+    at least trim_fraction * peak_in_run.  This removes trailing wallpaper
+    content (e.g. a character or gradient) that crosses the absolute threshold
+    but is clearly below the density of the actual window region.
     """
-    mask        = frac > threshold
-    transitions = np.diff(mask.astype(np.int8))
+    mask = frac > threshold
+    # Fill interior gaps of up to 5 rows
+    i = 0
+    while i < len(mask):
+        if not mask[i]:
+            j = i
+            while j < len(mask) and not mask[j]:
+                j += 1
+            if j - i <= 5 and i > 0 and j < len(mask):
+                mask[i:j] = True
+            i = j
+        else:
+            i += 1
+    transitions  = np.diff(mask.astype(np.int8))
     starts      = list(np.where(transitions == 1)[0] + 1)
     ends        = list(np.where(transitions == -1)[0])
     if mask[0]:  starts = [0] + starts  # noqa: E701
@@ -184,7 +262,17 @@ def _longest_window_run(frac: np.ndarray, threshold: float) -> Optional[tuple[in
         return None
     lengths = [e - s for s, e in zip(starts, ends)]
     i       = int(np.argmax(lengths))
-    return int(starts[i]), int(ends[i])
+    s, e    = int(starts[i]), int(ends[i])
+
+    if trim_fraction > 0 and e > s:
+        peak        = float(frac[s:e + 1].max())
+        trim_thresh = trim_fraction * peak
+        while s <= e and frac[s] < trim_thresh:
+            s += 1
+        while e >= s and frac[e] < trim_thresh:
+            e -= 1
+
+    return (s, e) if s <= e else None
 
 
 def _detect_by_luminance(img: np.ndarray, sensitivity: float) -> Optional[Rect]:
@@ -199,10 +287,11 @@ def _detect_by_luminance(img: np.ndarray, sensitivity: float) -> Optional[Rect]:
     cs   = max(8, min(h, w) // 30)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    corner_brightness = float(np.mean([
-        gray[:cs, :cs].mean(), gray[:cs, w-cs:].mean(),
-        gray[h-cs:, :cs].mean(), gray[h-cs:, w-cs:].mean(),
-    ]))
+    corner_patches = [
+        gray[:cs, :cs], gray[:cs, w-cs:],
+        gray[h-cs:, :cs], gray[h-cs:, w-cs:],
+    ]
+    corner_brightness = float(np.mean([p.mean() for p in corner_patches]))
 
     thresh_val, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
@@ -214,10 +303,10 @@ def _detect_by_luminance(img: np.ndarray, sensitivity: float) -> Optional[Rect]:
     fg          = binary > 0
     row_frac    = fg.mean(axis=1)
     col_frac    = fg.mean(axis=0)
-    frac_thresh = 0.30 - sensitivity * 0.10   # 0.30 strict ... 0.20 loose
+    frac_thresh = 0.25 - sensitivity * 0.15   # More tolerant than before
 
-    rows = _longest_window_run(row_frac, frac_thresh)
-    cols = _longest_window_run(col_frac, frac_thresh)
+    rows = _longest_window_run(row_frac, frac_thresh, trim_fraction=0.50)
+    cols = _longest_window_run(col_frac, frac_thresh, trim_fraction=0.50)
     if rows is None or cols is None:
         return None
 
@@ -241,19 +330,20 @@ def _detect_by_background(img: np.ndarray, sensitivity: float) -> Optional[Rect]
     ]
     corner_means = np.array([p.mean(axis=(0, 1)) for p in corner_patches], dtype=np.float32)
 
-    if corner_means.std(axis=0).mean() > 40:
+    # Increased tolerance for corner variance (gradients)
+    if corner_means.std(axis=0).mean() > 60:
         return None
 
     bg          = np.median(corner_means, axis=0)
-    threshold   = 20 + sensitivity * 25
+    threshold   = 15 + sensitivity * 35
     diff        = np.abs(img.astype(np.float32) - bg).mean(axis=2)
     fg          = diff > threshold
     row_frac    = fg.mean(axis=1)
     col_frac    = fg.mean(axis=0)
-    frac_thresh = 0.30 - sensitivity * 0.10
+    frac_thresh = 0.25 - sensitivity * 0.15
 
-    rows = _longest_window_run(row_frac, frac_thresh)
-    cols = _longest_window_run(col_frac, frac_thresh)
+    rows = _longest_window_run(row_frac, frac_thresh, trim_fraction=0.50)
+    cols = _longest_window_run(col_frac, frac_thresh, trim_fraction=0.50)
     if rows is None or cols is None:
         return None
 
@@ -273,34 +363,29 @@ def _detect_by_edges(img: np.ndarray, sensitivity: float) -> Optional[Rect]:
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
     med   = float(np.median(blurred))
-    sigma = 0.25 + sensitivity * 0.40
+    sigma = 0.20 + sensitivity * 0.50
     lo    = max(0,   int(med * (1 - sigma)))
     hi    = min(255, int(med * (1 + sigma)))
     edges = cv2.Canny(blurred, lo, hi)
 
-    min_len = int(min(w, h) * (0.35 - sensitivity * 0.10))
+    min_len = int(min(w, h) * (0.30 - sensitivity * 0.15))
     lines   = cv2.HoughLinesP(
         edges, 1, np.pi / 180,
-        threshold=max(30, min_len // 3),
+        threshold=max(20, min_len // 4),
         minLineLength=min_len,
-        maxLineGap=30,
+        maxLineGap=40,
     )
     if lines is None:
         return None
 
-    margin = 4
     h_ys, v_xs = [], []
     for line in lines:
         x1, y1, x2, y2 = line[0]
         dy, dx = abs(y2 - y1), abs(x2 - x1)
         if dx > 0 and dy / dx < 0.10:
-            mid_y = (y1 + y2) // 2
-            if margin < mid_y < h - margin:
-                h_ys.append(mid_y)
+            h_ys.append((y1 + y2) // 2)
         elif dy > 0 and dx / dy < 0.10:
-            mid_x = (x1 + x2) // 2
-            if margin < mid_x < w - margin:
-                v_xs.append(mid_x)
+            v_xs.append((x1 + x2) // 2)
 
     if not h_ys or not v_xs:
         return None
@@ -312,6 +397,44 @@ def _detect_by_edges(img: np.ndarray, sensitivity: float) -> Optional[Rect]:
     if bw < 50 or bh < 50:
         return None
     return Rect(left, top, bw, bh)
+
+
+def _detect_by_contours(img: np.ndarray, sensitivity: float) -> Optional[Rect]:
+    """
+    Detect window by finding the largest external contour.
+    Robust against screenshots with complex but distinct wallpaper.
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Use a fairly permissive Canny to get a good outline
+    med = np.median(blurred)
+    lo = int(max(0, (0.8 - sensitivity * 0.5) * med))
+    hi = int(min(255, (1.2 + sensitivity * 0.5) * med))
+    edged = cv2.Canny(blurred, lo, hi)
+
+    # Dilate to join any small gaps in the window border
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    dilated = cv2.dilate(edged, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    min_area = 0.10 * w * h
+    max_area = 0.99 * w * h
+    best_rect = None
+    max_found_area = 0
+
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if min_area < area < max_area and area > max_found_area:
+            max_found_area = area
+            best_rect = Rect(x, y, bw, bh)
+
+    return best_rect
 
 
 def make_normalised_canvas(
@@ -336,18 +459,12 @@ def make_normalised_canvas(
     wx2 = min(iw, det.x + det.w); wy2 = min(ih, det.y + det.h)  # noqa: E702
     window_crop = img[wy1:wy2, wx1:wx2]
 
-    # If the window isn't the target size, it will be centered in a blank canvas
-    # and the edges will be filled by the _blit logic below.
-
     out_w = target_w + 2 * padding
     out_h = target_h + 2 * padding
 
-    # ── Wallpaper border / Fill ───────────────────────────────────────────────
-    # Top-Centered Alignment:
-    # Use exact specified padding for the top.
-    # Add all "normalisation" extra height to the bottom.
-    # Center the window horizontally.
-    pad_t = padding
+    # ── Centered Alignment ────────────────────────────────────────────────────
+    # Uniformly distribute extra space around the window
+    pad_t = (target_h - det.h) // 2 + padding
     pad_b = out_h - det.h - pad_t
     pad_l = (target_w - det.w) // 2 + padding
     pad_r = out_w - det.w - pad_l
@@ -473,7 +590,7 @@ def normalise_all(
             # Re-load if it was cleared for memory
             entry.image = cv2.imread(str(entry.path))
             if entry.image is None or entry.window is None:
-                errors.append(f"{entry.filename}: skipped -- could not load image")
+                errors.append(f"{entry.filename}: skipped, could not load image")
                 continue
 
         det    = entry.window
@@ -547,9 +664,9 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("Screenshot Normaliser")
-        self.geometry("1020x660")
-        self.minsize(760, 500)
+        self.title("Screenshot normaliser")
+        self.geometry("1280x660")
+        self.minsize(960, 500)
 
         self.entries:        list[ScreenshotEntry] = []
         self._sel_idx:       int                   = -1
@@ -604,11 +721,25 @@ class App(tk.Tk):
             fieldbackground=c["bg_input"], foreground=c["fg"],
             bordercolor=c["border"], arrowcolor=c["fg"],
         )
+        style.configure("TCombobox",
+            fieldbackground=c["bg_input"], foreground=c["fg"],
+            background=c["btn_bg"], arrowcolor=c["fg"],
+            bordercolor=c["border"], selectbackground=c["sel_bg"],
+            selectforeground=c["fg"],
+        )
+        style.map("TCombobox",
+            fieldbackground=[("readonly", c["bg_input"])],
+            foreground=[("readonly", c["fg"])],
+            selectbackground=[("readonly", c["sel_bg"])],
+            selectforeground=[("readonly", c["fg"])],
+        )
+        self.option_add("*TCombobox*Listbox.background",       c["bg_input"])
+        self.option_add("*TCombobox*Listbox.foreground",       c["fg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["sel_bg"])
+        self.option_add("*TCombobox*Listbox.selectForeground", c["fg"])
+
         style.configure("TScale",
             background=c["bg"], troughcolor=c["bg_input"], sliderthickness=14,
-        )
-        style.configure("TProgressbar",
-            troughcolor=c["bg_alt"], background="#0078d4", bordercolor=c["border"],
         )
         style.configure("TScrollbar",
             background=c["bg_alt"], troughcolor=c["bg"],
@@ -640,15 +771,11 @@ class App(tk.Tk):
         # Pack order matters: BOTTOM items first, then the expanding centre pane.
 
         # Status bar
-        self.status_var = tk.StringVar(value="Ready -- add screenshots to begin.")
+        self.status_var = tk.StringVar(value="Ready for screenshots to be added...")
         ttk.Label(
             self, textvariable=self.status_var,
             relief=tk.SUNKEN, anchor=tk.W, padding=(8, 3),
         ).pack(fill=tk.X, side=tk.BOTTOM)
-
-        # Progress bar
-        self.progress = ttk.Progressbar(self, mode="determinate")
-        self.progress.pack(fill=tk.X, side=tk.BOTTOM, padx=8, pady=(0, 2))
 
         # Settings / actions bar
         sf = ttk.Frame(self, padding=(8, 5))
@@ -661,42 +788,40 @@ class App(tk.Tk):
         )
         ttk.Label(sf, text="px").pack(side=tk.LEFT, padx=(0, 14))
 
-        ttk.Label(sf, text="Edge fill:").pack(side=tk.LEFT)
+        ttk.Label(sf, text="Edge fill method:").pack(side=tk.LEFT)
         self.edge_var = tk.StringVar(value="smear")
         cb = ttk.Combobox(sf, textvariable=self.edge_var, values=["smear", "median", "custom"], width=8, state="readonly")
         cb.pack(side=tk.LEFT, padx=(3, 4))
 
-        self.color_btn = ttk.Button(sf, text="Pick Color...", command=self.pick_fill_color)
+        self.color_btn = ttk.Button(sf, text="Fill color", command=self.pick_fill_color, state=tk.DISABLED)
         self.color_btn.pack(side=tk.LEFT, padx=2)
         self.color_swatch = tk.Canvas(sf, width=20, height=20, bd=1, highlightthickness=0, bg="#ffffff")
         self.color_swatch.pack(side=tk.LEFT, padx=(2, 14))
-        self.custom_color_rgb = (255, 255, 255) # Default white
+        self.custom_color_rgb = (255, 255, 255)
+        self.edge_var.trace_add("write", self._on_edge_mode_change)
 
-        ttk.Label(sf, text="Detection sensitivity:").pack(side=tk.LEFT)
+        ttk.Label(sf, text="Detect sensitivity:").pack(side=tk.LEFT)
         self.sens_var = tk.DoubleVar(value=0.5)
         ttk.Scale(
             sf, from_=0, to=1, variable=self.sens_var,
             orient=tk.HORIZONTAL, length=120,
         ).pack(side=tk.LEFT, padx=(3, 2))
-        ttk.Label(sf, text="Low -> High", foreground=c["fg_dim"]).pack(
-            side=tk.LEFT, padx=(0, 16)
-        )
 
         ttk.Separator(sf, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(sf, text="Detect Windows",  command=self.run_detect   ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(sf, text="Normalise & Save", command=self.run_normalise).pack(side=tk.LEFT, padx=4)
+        ttk.Button(sf, text="Analyse images",  command=self.run_detect).pack(side=tk.LEFT, padx=4)
+        ttk.Button(sf, text="Process and save", command=self.run_normalise).pack(side=tk.LEFT, padx=4)
 
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, side=tk.BOTTOM)
 
         # Toolbar
         tb = ttk.Frame(self, padding=(8, 6))
         tb.pack(fill=tk.X, side=tk.TOP)
-        ttk.Button(tb, text="+ Add Files", command=self.add_files).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tb, text="Clear All",   command=self.clear_all).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tb, text="+ Add images", command=self.add_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tb, text="Reset",   command=self.clear_all).pack(side=tk.LEFT, padx=2)
         ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Label(tb, text="Output folder:").pack(side=tk.LEFT)
         self.out_var = tk.StringVar()
-        ttk.Entry(tb, textvariable=self.out_var, width=38).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Entry(tb, textvariable=self.out_var, width=50).pack(side=tk.LEFT, padx=6)
         ttk.Button(tb, text="Browse...", command=self.browse_output).pack(side=tk.LEFT)
 
         # Centre: split pane
@@ -765,7 +890,7 @@ class App(tk.Tk):
                 self.out_var.set(str(Path(paths[0]).parent / "normalised"))
             n = len(self.entries)
             self.status_var.set(
-                f"{n} file(s) loaded.  Click 'Detect Windows' to analyse them."
+                f"{n} image(s) loaded.  Click 'Analyse images' to continue."
             )
 
     def clear_all(self) -> None:
@@ -774,21 +899,24 @@ class App(tk.Tk):
         self._refresh_list()
         self.canvas.delete("all")
         self.info_label.config(text="")
-        self.status_var.set("Ready -- add screenshots to begin.")
+        self.status_var.set("Ready for screenshots to be added...")
 
     def browse_output(self) -> None:
         d = filedialog.askdirectory(title="Choose output folder")
         if d:
             self.out_var.set(d)
 
+    def _on_edge_mode_change(self, *_: object) -> None:
+        state = tk.NORMAL if self.edge_var.get() == "custom" else tk.DISABLED
+        self.color_btn.configure(state=state)
+
     def pick_fill_color(self) -> None:
         rgb, hex_color = colorchooser.askcolor(
-            initialcolor="#ffffff", title="Choose fill color"
+            initialcolor="#ffffff", title="Choose edge fill color"
         )
         if rgb and hex_color:
             self.custom_color_rgb = tuple(int(x) for x in rgb)
             self.color_swatch.config(bg=hex_color)
-            self.edge_var.set("custom")
 
     # ── List helpers ──────────────────────────────────────────────────────────
 
@@ -852,8 +980,7 @@ class App(tk.Tk):
                 text=f"Cannot load {entry.filename}", foreground=self._c["err_fg"]
             )
             return
-        if self._sel_idx == idx:
-            self._draw_preview(idx)
+        self._draw_preview(idx)
 
     def _draw_preview(self, idx: int) -> None:
         entry = self.entries[idx]
@@ -894,7 +1021,7 @@ class App(tk.Tk):
             )
         elif entry.status == "failed":
             self.info_label.config(
-                text=f"Detection failed -- try raising sensitivity.  {entry.error or ''}",
+                text=f"Detection failed: try increasing sensitivity.  {entry.error or ''}",
                 foreground=self._c["err_fg"],
             )
         else:
@@ -914,7 +1041,6 @@ class App(tk.Tk):
         try:
             sensitivity = self.sens_var.get()
             total       = len(self.entries)
-            self.after(0, lambda: self.progress.configure(maximum=total, value=0))
 
             for i, entry in enumerate(self.entries):
                 self.after(0, lambda fn=entry.filename, j=i+1:
@@ -926,7 +1052,6 @@ class App(tk.Tk):
                         entry.status = "failed"
                         entry.error  = "Could not load image"
                         self.after(0, self._refresh_list)
-                        self.after(0, lambda v=i+1: self.progress.configure(value=v))
                         continue
                     entry.image = img
 
@@ -938,7 +1063,7 @@ class App(tk.Tk):
                 else:
                     entry.window = None
                     entry.status = "failed"
-                    entry.error  = "No window boundary found -- try adjusting sensitivity"
+                    entry.error  = "No window boundary found: try adjusting sensitivity"
 
                 # Keep image in memory ONLY if it's currently being previewed
                 if self._sel_idx != i:
@@ -947,7 +1072,6 @@ class App(tk.Tk):
                 captured_i = i
                 self.after(0, self._refresh_list)
                 self.after(0, lambda ci=captured_i: self._maybe_redraw(ci))
-                self.after(0, lambda v=i+1: self.progress.configure(value=v))
 
             ok   = sum(1 for e in self.entries if e.status == "detected")
             fail = total - ok
@@ -958,12 +1082,11 @@ class App(tk.Tk):
                 widths  = [e.window.w for e in self.entries if e.window]
                 heights = [e.window.h for e in self.entries if e.window]
                 if max(widths) - min(widths) > 20 or max(heights) - min(heights) > 20:
-                    size_str += "  -- sizes vary, check detections before saving"
+                    size_str += ": sizes vary, check detections before saving"
 
             self.after(0, lambda: self.status_var.set(
-                f"Detection complete -- {ok} detected, {fail} failed{size_str}"
+                f"Detection complete: {ok} detected, {fail} failed{size_str}"
             ))
-            self.after(0, lambda: self.progress.configure(value=0))
         finally:
             self._work_lock.release()
 
@@ -978,7 +1101,7 @@ class App(tk.Tk):
             messagebox.showwarning("No files", "Add screenshots first.")
             return
         if not any(e.window for e in self.entries):
-            messagebox.showwarning("No detections", "Run 'Detect Windows' first.")
+            messagebox.showwarning("No detections", "Run 'Analyse images' first.")
             return
         out = self.out_var.get().strip()
         if not out:
@@ -987,10 +1110,10 @@ class App(tk.Tk):
         try:
             padding = self.padding_var.get()
         except tk.TclError:
-            messagebox.showerror("Invalid padding", "Padding must be a whole number ≥ 0.")
+            messagebox.showerror("Invalid padding", "Padding must be a whole number >= 0.")
             return
         if padding < 0:
-            messagebox.showerror("Invalid padding", "Padding must be ≥ 0.")
+            messagebox.showerror("Invalid padding", "Padding must be >= 0.")
             return
         if not self._work_lock.acquire(blocking=False):
             return
@@ -1000,20 +1123,15 @@ class App(tk.Tk):
 
     def _normalise_worker(self, padding: int, edge_mode: str, custom_color: tuple[int, int, int]) -> None:
         out_dir = Path(self.out_var.get())
-        total   = len(self.entries)
-        self.after(0, lambda: self.progress.configure(maximum=total, value=0))
-
         try:
             try:
                 out_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 self.after(0, lambda e=exc, d=out_dir: self._handle_output_dir_error(e, d))
-                self.after(0, lambda: self.progress.configure(value=0))
                 return
 
             def progress_cb(i: int, n: int, name: str) -> None:
                 self.after(0, lambda: self.status_var.set(f"Saving {name}  ({i}/{n})..."))
-                self.after(0, lambda: self.progress.configure(value=i))
 
             try:
                 saved, errors = normalise_all(self.entries, padding, out_dir, progress_cb, edge_mode, custom_color)
@@ -1021,20 +1139,17 @@ class App(tk.Tk):
                 self.after(0, lambda e=exc: messagebox.showerror(
                     "Unexpected error", f"Normalisation failed:\n{e}"
                 ))
-                self.after(0, lambda: self.status_var.set("Normalisation failed -- see error dialog."))
-                self.after(0, lambda: self.progress.configure(value=0))
+                self.after(0, lambda: self.status_var.set("Normalisation failed, see error dialog."))
                 return
 
             # Free memory now that images have been saved.
             for entry in self.entries:
                 entry.image = None
-
-            self.after(0, lambda: self.progress.configure(value=0))
             msg = f"Saved {len(saved)} image(s) to:\n{out_dir}"
             if errors:
                 msg += "\n\nSkipped / errors:\n" + "\n".join(errors)
 
-            self.after(0, lambda: self.status_var.set(f"Done -- {len(saved)} image(s) saved."))
+            self.after(0, lambda: self.status_var.set(f"Done: {len(saved)} image(s) saved."))
             self.after(0, lambda: messagebox.showinfo("Normalisation complete", msg))
         finally:
             self._work_lock.release()
@@ -1048,9 +1163,9 @@ class App(tk.Tk):
         new_dir = filedialog.askdirectory(title="Choose a writable output folder")
         if new_dir:
             self.out_var.set(new_dir)
-            self.status_var.set("Output folder updated -- click Normalise & Save to try again.")
+            self.status_var.set("Output folder updated: click 'Process & save' to try again.")
         else:
-            self.status_var.set("Normalisation cancelled -- no output folder selected.")
+            self.status_var.set("Normalisation cancelled: no output folder selected.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1060,6 +1175,7 @@ class App(tk.Tk):
 def main() -> None:
     _fix_dpi()   # must be before Tk() is created
     app = App()
+
     # Scale fonts to actual screen DPI so text isn't tiny on high-DPI displays
     if sys.platform == "win32":
         try:

@@ -10,9 +10,6 @@ __pycache__/
 # app test files and output
 samples/
 
-# Claude Code dir
-.claude/
-
 # OS
 .DS_Store
 Thumbs.db
